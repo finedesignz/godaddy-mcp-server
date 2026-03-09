@@ -6,44 +6,60 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { GoDaddyClient } from "./godaddy-client.js";
 
-// ── Config ──────────────────────────────────────────────────────
-function getConfig(): { apiKey: string; apiSecret: string; env: "production" | "ote" } {
-  // Prefer env vars (for Docker/Coolify), fall back to CLI args
-  let apiKey = process.env.GODADDY_API_KEY || "";
-  let apiSecret = process.env.GODADDY_API_SECRET || "";
-  let env = (process.env.GODADDY_ENV || "production") as "production" | "ote";
-
-  if (!apiKey || !apiSecret) {
-    const args = process.argv.slice(2);
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "--api-key" && args[i + 1]) apiKey = args[++i];
-      else if (args[i] === "--api-secret" && args[i + 1]) apiSecret = args[++i];
-      else if (args[i] === "--env" && args[i + 1]) env = args[++i] as "production" | "ote";
-    }
-  }
-
-  if (!apiKey || !apiSecret) {
-    console.error("Set GODADDY_API_KEY and GODADDY_API_SECRET env vars, or use --api-key and --api-secret flags.");
-    process.exit(1);
-  }
-
-  return { apiKey, apiSecret, env };
-}
-
-const config = getConfig();
-const gd = new GoDaddyClient(config);
-
 // ── Helper ───────────────────────────────────────────────────────
 function json(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-// ── MCP Server ───────────────────────────────────────────────────
+function errorResult(msg: string) {
+  return { content: [{ type: "text" as const, text: msg }], isError: true as const };
+}
+
+// ── MCP Server Factory ──────────────────────────────────────────
+// Each session gets its own server instance with its own credentials.
 function createServer() {
   const server = new McpServer({
     name: "godaddy",
     version: "1.0.0",
   });
+
+  // Session-scoped credential state
+  let gd: GoDaddyClient | null = null;
+
+  function requireClient(): GoDaddyClient {
+    if (!gd) throw new Error("NOT_CONFIGURED");
+    return gd;
+  }
+
+  // ─── Set Credentials (must be called first) ──────────────────────
+  server.tool(
+    "set_credentials",
+    "Set GoDaddy API credentials for this session. Must be called before any other tool.",
+    {
+      apiKey: z.string().describe("GoDaddy API key"),
+      apiSecret: z.string().describe("GoDaddy API secret"),
+      env: z.enum(["production", "ote"]).optional().describe("API environment (default: production)"),
+    },
+    async ({ apiKey, apiSecret, env }) => {
+      gd = new GoDaddyClient({ apiKey, apiSecret, env: env || "production" });
+      return json({ status: "ok", message: "Credentials set. You can now use all GoDaddy tools." });
+    }
+  );
+
+  // ── Wrap tool handlers to check credentials ────────────────────
+  function authed<T>(fn: (client: GoDaddyClient, args: T) => Promise<any>) {
+    return async (args: T) => {
+      try {
+        const client = requireClient();
+        return await fn(client, args);
+      } catch (err: any) {
+        if (err.message === "NOT_CONFIGURED") {
+          return errorResult("Credentials not set. Call set_credentials first with your GoDaddy API key and secret.");
+        }
+        throw err;
+      }
+    };
+  }
 
   // ─── List Domains ────────────────────────────────────────────────
   server.tool(
@@ -54,10 +70,9 @@ function createServer() {
       limit: z.number().optional().describe("Max results to return (default 100)"),
       marker: z.string().optional().describe("Marker for pagination"),
     },
-    async ({ statuses, limit, marker }) => {
-      const result = await gd.listDomains({ statuses, limit, marker });
-      return json(result);
-    }
+    authed(async (client, { statuses, limit, marker }) => {
+      return json(await client.listDomains({ statuses, limit, marker }));
+    })
   );
 
   // ─── Get Domain Details ──────────────────────────────────────────
@@ -65,7 +80,7 @@ function createServer() {
     "get_domain",
     "Get detailed information about a specific domain including status, nameservers, contacts, and expiration.",
     { domain: z.string().describe("Domain name (e.g. example.com)") },
-    async ({ domain }) => json(await gd.getDomain(domain))
+    authed(async (client, { domain }) => json(await client.getDomain(domain)))
   );
 
   // ─── Check Domain Availability ───────────────────────────────────
@@ -76,7 +91,7 @@ function createServer() {
       domain: z.string().describe("Domain to check (e.g. example.com)"),
       checkType: z.enum(["FAST", "FULL"]).optional().describe("FAST for quick check, FULL for detailed pricing"),
     },
-    async ({ domain, checkType }) => json(await gd.checkAvailability(domain, checkType))
+    authed(async (client, { domain, checkType }) => json(await client.checkAvailability(domain, checkType)))
   );
 
   // ─── Update Domain ───────────────────────────────────────────────
@@ -90,7 +105,7 @@ function createServer() {
       renewAuto: z.boolean().optional().describe("Enable/disable auto-renewal"),
       subaccountId: z.string().optional().describe("Reseller subaccount ID"),
     },
-    async ({ domain, ...update }) => json(await gd.updateDomain(domain, update))
+    authed(async (client, { domain, ...update }) => json(await client.updateDomain(domain, update)))
   );
 
   // ─── Cancel Domain ───────────────────────────────────────────────
@@ -98,7 +113,7 @@ function createServer() {
     "cancel_domain",
     "Cancel a purchased domain registration.",
     { domain: z.string().describe("Domain name to cancel") },
-    async ({ domain }) => json(await gd.cancelDomain(domain))
+    authed(async (client, { domain }) => json(await client.cancelDomain(domain)))
   );
 
   // ─── Purchase Domain ─────────────────────────────────────────────
@@ -128,8 +143,8 @@ function createServer() {
         }),
       }).describe("Registrant contact info"),
     },
-    async ({ domain, agreedAt, agreedBy, agreementKeys, contactRegistrant, ...rest }) => {
-      const result = await gd.purchaseDomain({
+    authed(async (client, { domain, agreedAt, agreedBy, agreementKeys, contactRegistrant, ...rest }) => {
+      const result = await client.purchaseDomain({
         domain,
         consent: { agreedAt, agreedBy, agreementKeys },
         contactRegistrant,
@@ -139,7 +154,7 @@ function createServer() {
         ...rest,
       });
       return json(result);
-    }
+    })
   );
 
   // ─── Renew Domain ────────────────────────────────────────────────
@@ -150,7 +165,7 @@ function createServer() {
       domain: z.string().describe("Domain to renew"),
       period: z.number().optional().describe("Renewal period in years (default 1)"),
     },
-    async ({ domain, period }) => json(await gd.renewDomain(domain, period))
+    authed(async (client, { domain, period }) => json(await client.renewDomain(domain, period)))
   );
 
   // ─── Transfer Domain ─────────────────────────────────────────────
@@ -165,14 +180,14 @@ function createServer() {
       agreementKeys: z.array(z.string()).describe("Agreement keys from get_agreements"),
       period: z.number().optional().describe("Registration period in years"),
     },
-    async ({ domain, authCode, agreedAt, agreedBy, agreementKeys, period }) => {
-      const result = await gd.transferDomain(domain, {
+    authed(async (client, { domain, authCode, agreedAt, agreedBy, agreementKeys, period }) => {
+      const result = await client.transferDomain(domain, {
         authCode,
         consent: { agreedAt, agreedBy, agreementKeys },
         period,
       });
       return json(result);
-    }
+    })
   );
 
   // ─── Get DNS Records ─────────────────────────────────────────────
@@ -186,10 +201,9 @@ function createServer() {
       limit: z.number().optional().describe("Max records to return"),
       offset: z.number().optional().describe("Offset for pagination"),
     },
-    async ({ domain, type, name, limit, offset }) => {
-      const result = await gd.getDnsRecords(domain, type, name, { limit, offset });
-      return json(result);
-    }
+    authed(async (client, { domain, type, name, limit, offset }) => {
+      return json(await client.getDnsRecords(domain, type, name, { limit, offset }));
+    })
   );
 
   // ─── Add DNS Records ─────────────────────────────────────────────
@@ -206,7 +220,7 @@ function createServer() {
         priority: z.number().optional().describe("Priority (required for MX and SRV)"),
       })).describe("DNS records to add"),
     },
-    async ({ domain, records }) => json(await gd.addDnsRecords(domain, records))
+    authed(async (client, { domain, records }) => json(await client.addDnsRecords(domain, records)))
   );
 
   // ─── Replace DNS Records ─────────────────────────────────────────
@@ -225,15 +239,15 @@ function createServer() {
         priority: z.number().optional().describe("Priority (for MX/SRV)"),
       })).describe("Replacement records"),
     },
-    async ({ domain, type, name, records }) => {
+    authed(async (client, { domain, type, name, records }) => {
       if (type && name) {
-        return json(await gd.replaceDnsRecordsByTypeName(domain, type, name, records));
+        return json(await client.replaceDnsRecordsByTypeName(domain, type, name, records));
       } else if (type) {
-        return json(await gd.replaceDnsRecordsByType(domain, type, records as any));
+        return json(await client.replaceDnsRecordsByType(domain, type, records as any));
       } else {
-        return json(await gd.replaceAllDnsRecords(domain, records as any));
+        return json(await client.replaceAllDnsRecords(domain, records as any));
       }
-    }
+    })
   );
 
   // ─── Delete DNS Records ──────────────────────────────────────────
@@ -245,9 +259,9 @@ function createServer() {
       type: z.enum(["A", "AAAA", "CNAME", "MX", "NS", "SRV", "TXT", "CAA"]).describe("Record type to delete"),
       name: z.string().describe("Record name to delete (use '@' for root)"),
     },
-    async ({ domain, type, name }) => {
-      return json(await gd.replaceDnsRecordsByTypeName(domain, type, name, []));
-    }
+    authed(async (client, { domain, type, name }) => {
+      return json(await client.replaceDnsRecordsByTypeName(domain, type, name, []));
+    })
   );
 
   // ─── Update Domain Contacts ──────────────────────────────────────
@@ -277,7 +291,7 @@ function createServer() {
       contactRegistrant: contactSchema.describe("Registrant contact"),
       contactTech: contactSchema.describe("Technical contact"),
     },
-    async ({ domain, ...contacts }) => json(await gd.updateContacts(domain, contacts))
+    authed(async (client, { domain, ...contacts }) => json(await client.updateContacts(domain, contacts)))
   );
 
   // ─── Purchase Privacy ────────────────────────────────────────────
@@ -290,9 +304,9 @@ function createServer() {
       agreedBy: z.string().describe("IP address of the agreeing party"),
       agreementKeys: z.array(z.string()).describe("Agreement keys"),
     },
-    async ({ domain, agreedAt, agreedBy, agreementKeys }) => {
-      return json(await gd.purchasePrivacy(domain, { agreedAt, agreedBy, agreementKeys }));
-    }
+    authed(async (client, { domain, agreedAt, agreedBy, agreementKeys }) => {
+      return json(await client.purchasePrivacy(domain, { agreedAt, agreedBy, agreementKeys }));
+    })
   );
 
   // ─── Cancel Privacy ──────────────────────────────────────────────
@@ -300,7 +314,7 @@ function createServer() {
     "cancel_privacy",
     "Cancel WHOIS privacy protection for a domain.",
     { domain: z.string().describe("Domain name") },
-    async ({ domain }) => json(await gd.cancelPrivacy(domain))
+    authed(async (client, { domain }) => json(await client.cancelPrivacy(domain)))
   );
 
   // ─── Verify Registrant Email ─────────────────────────────────────
@@ -308,7 +322,7 @@ function createServer() {
     "verify_registrant_email",
     "Re-send the registrant email verification for a domain.",
     { domain: z.string().describe("Domain name") },
-    async ({ domain }) => json(await gd.verifyRegistrantEmail(domain))
+    authed(async (client, { domain }) => json(await client.verifyRegistrantEmail(domain)))
   );
 
   // ─── Get TLDs ────────────────────────────────────────────────────
@@ -316,7 +330,7 @@ function createServer() {
     "get_tlds",
     "List all top-level domains (TLDs) available for registration.",
     {},
-    async () => json(await gd.getTlds())
+    authed(async (client) => json(await client.getTlds()))
   );
 
   // ─── Get Agreements ──────────────────────────────────────────────
@@ -328,7 +342,7 @@ function createServer() {
       privacy: z.boolean().describe("Include privacy agreement"),
       forTransfer: z.boolean().optional().describe("Get transfer agreements instead of registration"),
     },
-    async ({ tlds, privacy, forTransfer }) => json(await gd.getAgreements(tlds, privacy, forTransfer))
+    authed(async (client, { tlds, privacy, forTransfer }) => json(await client.getAgreements(tlds, privacy, forTransfer)))
   );
 
   return server;
